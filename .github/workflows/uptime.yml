@@ -1,0 +1,39 @@
+# uptime.yml -- the outside check of www.eventwiz.ai. Lives at .github/workflows/uptime.yml in
+# github.com/gavwolek-source/eventwiz-uptime (public, so GitHub's runner minutes cost nothing).
+# Source of truth: eventwiz scripts/uptime-monitor/ (launch-restore-alert-1, 2026-09-27); publish.sh copies it here.
+#
+# Every 5 minutes (GitHub may start a scheduled run late under load; the report measures how late), one run checks
+# the site twice, 150 s apart, and Telegrams Gavin ONCE when it goes down and ONCE when it comes back.
+# The live targets are the secret TARGETS_JSON; the repo variable TEST_TARGETS, when set, adds a labelled TEST monitor
+# that is how the alarm is proved (point it at an address that answers 500, and the TEST message arrives).
+name: uptime
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_targets:
+        description: 'JSON list of targets for a labelled TEST monitor (overrides the TEST_TARGETS variable)'
+        required: false
+        default: ''
+permissions:
+  contents: write   # to commit state/*.json when the site's state changes (and only then)
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: self-test (the rules, against a fake network -- a red here means the checker itself is broken)
+        run: node --version && node check.mjs --self-test
+      - name: check the site
+        env:
+          TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
+          TEST_TARGETS: ${{ github.event.inputs.test_targets || vars.TEST_TARGETS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COMMIT_STATE: '1'
+        run: node check.mjs
