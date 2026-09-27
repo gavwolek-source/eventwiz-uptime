@@ -7,7 +7,9 @@
 //
 // What it does, each run (the workflow starts one every 5 minutes):
 //   ROUNDS rounds, ROUND_GAP seconds apart. In each round every target is fetched at once. A target that fails is
-//   fetched again RETRY_GAP seconds later, and only a failure that REPEATS counts (a single blip never pages).
+//   fetched again RETRIES times, RETRY_GAP seconds apart, and only a failure that repeats EVERY time counts.
+//   (MEASURED 2026-09-27 on GitHub's runners: single connection resets in 0.1 s happen -- one on the live event data,
+//   two in a row from a third-party test host -- so one recheck was not enough; two blips never page.)
 //   Site state: DOWN if any target's failure repeated, UP if every target passed, and UNKNOWN when this machine
 //   could not reach the control address either -- a runner with no network is not an outage, and UNKNOWN never
 //   changes the state or sends a message.
@@ -21,7 +23,7 @@
 //   TARGETS_JSON  the live targets (a secret: it names the event page)    -> state/live.json, no label
 //   TEST_TARGETS  labelled test targets (a repo variable, normally unset)  -> state/test.json, every message "TEST"
 //   Target: {"name": "rsvp api", "url": "...", "status": 404, "contains": "Invalid RSVP link", "headers": {...}}
-// Other env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ROUNDS (2), ROUND_GAP (150), RETRY_GAP (20), TIMEOUT (45),
+// Other env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ROUNDS (2), ROUND_GAP (150), RETRIES (2), RETRY_GAP (15), TIMEOUT (30),
 //   CONTROL_URL (https://api.github.com/zen), COMMIT_STATE=1 to commit+push a changed state file at once.
 // URLs are never printed: logs name targets only (the live list is a secret; GitHub also masks secrets).
 //
@@ -35,8 +37,9 @@ const num = (v, d) => (v === undefined || v === '' ? d : Number(v));
 const CFG = {
   rounds: num(process.env.ROUNDS, 2),
   roundGap: num(process.env.ROUND_GAP, 150),
-  retryGap: num(process.env.RETRY_GAP, 20),
-  timeout: num(process.env.TIMEOUT, 45),
+  retryGap: num(process.env.RETRY_GAP, 15),
+  retries: num(process.env.RETRIES, 2),
+  timeout: num(process.env.TIMEOUT, 30),
   control: process.env.CONTROL_URL || 'https://api.github.com/zen',
 };
 
@@ -70,14 +73,16 @@ export async function round(targets, io, cfg) {
   const control = await io.probe({ url: cfg.control, status: 200 }, cfg.timeout);
   const first = await Promise.all(targets.map((t) => io.probe(t, cfg.timeout)));
   const failed = targets.map((t, i) => (first[i].ok ? null : i)).filter((i) => i !== null);
-  const second = {};
-  if (failed.length) {
+  const again = {}; // i -> [recheck results]; a target stops being rechecked the moment one passes
+  let still = failed;
+  for (let k = 0; k < (cfg.retries ?? 1) && still.length; k++) {
     await io.sleep(cfg.retryGap);
-    await Promise.all(failed.map(async (i) => { second[i] = await io.probe(targets[i], cfg.timeout); }));
+    await Promise.all(still.map(async (i) => { (again[i] ||= []).push(await io.probe(targets[i], cfg.timeout)); }));
+    still = still.filter((i) => !again[i].at(-1).ok);
   }
-  const failing = failed.filter((i) => !second[i].ok).map((i) => ({ name: targets[i].name, why: second[i].why }));
+  const failing = still.map((i) => ({ name: targets[i].name, why: again[i].at(-1).why }));
   const lines = targets.map((t, i) => `${t.name}: ${first[i].why} ${(first[i].ms / 1000).toFixed(1)}s`
-    + (i in second ? ` -> recheck ${second[i].why} ${(second[i].ms / 1000).toFixed(1)}s` : ''));
+    + (again[i] || []).map((x) => ` -> recheck ${x.why} ${(x.ms / 1000).toFixed(1)}s`).join(''));
   lines.push(`control: ${control.ok ? 'reachable' : control.why}`);
   if (!failing.length) return { state: 'UP', failing, lines };
   // this machine cannot reach the outside world either: we cannot see the site, which is not the same as it being down
@@ -167,7 +172,7 @@ function monitorsFromEnv(env = process.env) {
 
 // ── self-test: every rule in the header, against a fake network, clock and Telegram ─────────────────────────
 async function selfTest() {
-  const cfg = { rounds: 1, roundGap: 0, retryGap: 0, timeout: 45, control: 'CONTROL' };
+  const cfg = { rounds: 1, roundGap: 0, retryGap: 0, retries: 2, timeout: 45, control: 'CONTROL' };
   let red = 0;
   const arm = (name, ok) => { console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}`); if (!ok) red++; };
   // scripted network: answers[url] is a list consumed per call (last one repeats)
@@ -189,9 +194,9 @@ async function selfTest() {
   await runAll(mon(), io, cfg);
   arm('S1 every target passes from no state: no message, nothing written', io.sent.length === 0 && io.store.f === null);
 
-  io = fakeIo({ E: [BAD, BAD] });
+  io = fakeIo({ E: [BAD, BAD, BAD] });
   await runAll(mon(), io, cfg);
-  arm('S2 a failure that repeats: ONE DOWN message naming the part and the reason; state DOWN',
+  arm('S2 a failure that repeats on both rechecks: ONE DOWN message naming the part and the reason; state DOWN',
     io.sent.length === 1 && /DOWN/.test(io.sent[0]) && /event page: HTTP 500/.test(io.sent[0]) && io.store.f?.status === 'DOWN');
 
   io = fakeIo({ E: [BAD, BAD] }, { state: { status: 'DOWN', since: Date.parse('2026-09-27T02:40:00Z') } });
@@ -207,9 +212,13 @@ async function selfTest() {
   await runAll(mon(), io, cfg);
   arm('S5 a single blip that passes on the recheck: no message', io.sent.length === 0 && io.store.f === null);
 
-  io = fakeIo({ H: [{ ok: true, why: 'HTTP 200', ms: 38000 }] });
+  io = fakeIo({ R: [BAD, BAD, OK] });
   await runAll(mon(), io, cfg);
-  arm('S6 slow but answering correctly (38 s): no message', io.sent.length === 0);
+  arm('S5b two blips in a row, then a pass on the second recheck: no message (measured on GitHub 2026-09-27)', io.sent.length === 0 && io.store.f === null);
+
+  io = fakeIo({ H: [{ ok: true, why: 'HTTP 200', ms: 25000 }] });
+  await runAll(mon(), io, cfg);
+  arm('S6 slow but answering correctly inside the 30 s limit (25 s): no message', io.sent.length === 0);
 
   io = fakeIo({ H: [BAD], E: [BAD], R: [BAD], CONTROL: [{ ok: false, why: 'could not connect', ms: 1 }] });
   await runAll(mon(), io, cfg);
@@ -246,7 +255,7 @@ async function selfTest() {
     (await (async () => { const lines = []; const io2 = fakeIo({ E: [BAD] }); io2.log = (s) => lines.push(s);
       await runAll(mon(), io2, cfg); return lines.length > 0 && lines.every((l) => !/https?:\/\//.test(l)); })()));
 
-  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 11/11');
+  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 12/12');
   return red ? 1 : 0;
 }
 
