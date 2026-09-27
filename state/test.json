@@ -1,0 +1,12 @@
+{
+ "status": "DOWN",
+ "since": 1790478557538,
+ "failing": [
+  {
+   "name": "test target (answers 500)",
+   "why": "HTTP 500"
+  }
+ ],
+ "changed_utc": "2026-09-27T03:09:17.538Z",
+ "telegram_message_id": 2222
+}
