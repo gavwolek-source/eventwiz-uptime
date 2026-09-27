@@ -1,7 +1,12 @@
 {
- "status": "UP",
- "since": 1790484030515,
- "failing": [],
- "changed_utc": "2026-09-27T04:40:30.515Z",
- "telegram_message_id": 2228
+ "status": "DOWN",
+ "since": 1790493450573,
+ "failing": [
+  {
+   "name": "test page",
+   "why": "HTTP 500"
+  }
+ ],
+ "changed_utc": "2026-09-27T07:17:30.573Z",
+ "telegram_message_id": 2232
 }
