@@ -9,6 +9,10 @@
 # does start picks it up again (the concurrency group keeps it to one run at a time).
 # Telegrams Gavin ONCE when the site goes down and ONCE when it comes back. Live targets: the secret TARGETS_JSON.
 # The alarm is proved with test-targets.json (re-read every round) or the TEST_TARGETS variable: labelled TEST messages.
+# A BROKEN CHECKER NEVER TURNS THE RUN RED (vercel-builds-uptime-1, 2026-09-27): a red run is GitHub emailing Gavin "All
+# jobs have failed" while the site is up (it did, 27 Sep 04:11Z). Every step is continue-on-error; the last step records
+# the checker's own health in state/health.json (on a change only) and the PC tells him in his digest. Only a real
+# outage reaches his phone, through check.mjs's own Telegram.
 name: uptime
 on:
   schedule:
@@ -35,9 +39,15 @@ jobs:
     timeout-minutes: 70
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: self-test (the rules, against a fake network -- a red here means the checker itself is broken)
+      - name: self-test (the rules, against a fake network -- a failure here means the checker itself is broken)
+        id: selftest
+        continue-on-error: true
         run: node --version && node check.mjs --self-test
       - name: check the site
+        id: check
+        if: ${{ steps.selftest.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 62
         env:
           TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
           TEST_TARGETS: ${{ github.event.inputs.test_targets || vars.TEST_TARGETS }}
@@ -48,7 +58,20 @@ jobs:
           ROUND_GAP: '120'
         run: node check.mjs
       - name: start the next run (only after a full 55-minute loop, so a broken run can never start a rapid chain)
+        id: chain
         if: ${{ !cancelled() && hashFiles('.chain-ok') != '' }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run uptime.yml --repo "$GITHUB_REPOSITORY" --ref main
+      - name: record the checker's own health (state/health.json, on a change only; never fails the run)
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          SELFTEST_OUTCOME: ${{ steps.selftest.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          CHAIN_OUTCOME: ${{ steps.chain.outcome }}
+          LOOP_MINUTES: ${{ github.event.inputs.once == 'yes' && '0' || '55' }}
+          COMMIT_STATE: '1'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node check.mjs --health

@@ -33,7 +33,18 @@
 //   CONTROL_URL (https://api.github.com/zen), COMMIT_STATE=1 to commit+push a changed state file at once.
 // URLs are never printed: logs name targets only (the live list is a secret; GitHub also masks secrets).
 //
+// 🔴 A BROKEN CHECKER NEVER GOES RED (vercel-builds-uptime-1, 2026-09-27). MEASURED: run 36293593043 (04:11Z) failed in
+// 6 s on this checker's own bug ("no targets configured"), and GitHub emailed Gavin "All jobs have failed" while the site
+// was up. A red run is GitHub's email to the person who started it; only a site outage may reach his phone, and that is
+// this file's own Telegram. So every step of the workflow is continue-on-error, a failure writes its reason to
+// `.checker-broken`, and the last step (`--health`, always runs) records {ok, kind, why} in state/health.json --
+// committed only when ok/kind CHANGES, like state/live.json. The PC reads it: UPTIME#1 goes OPEN, and
+// `reality-check-uptime.mjs --notify` (pipeline-uptime-watch.timer, hourly) puts ONE line in Gavin's digest when the
+// checker breaks and one when it is fixed. What the workflow cannot catch (the checkout step itself, a runner that
+// dies) still fails the run; GitHub's email for that is a per-person setting (see README).
+//
 //   node check.mjs              one run
+//   node check.mjs --health     (workflow's last step) record the checker's own health from the step outcomes; exit 0
 //   node check.mjs --self-test  hermetic proof of the rules above (no network, no Telegram); exit 1 on any red arm
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -144,6 +155,7 @@ export async function runAll(monitors, io, cfg = CFG) {
       const sent = await io.send(text);
       if (!sent.ok) {
         io.log(`${tag}state is ${res.state} but the message did not send: ${sent.why} -- state NOT advanced, next run retries`);
+        io.broken?.(`a ${res.state} message did not send (${sent.why})`);
         rc = 1;
         continue;
       }
@@ -163,6 +175,7 @@ function realIo() {
     sleep: (s) => new Promise((res) => setTimeout(res, s * 1000)),
     send: (text) => sendTelegram(text),
     chainOk: () => writeFileSync('.chain-ok', new Date().toISOString() + '\n'),
+    broken: noteBroken,
     readState: (f) => { try { return JSON.parse(readFileSync(f, 'utf8')); } catch { return null; } },
     writeState: (f, v) => {
       mkdirSync(dirname(f), { recursive: true });
@@ -177,6 +190,32 @@ function realIo() {
       } catch (e) { console.log(`state commit failed (the message was sent; the next run may send it again): ${String(e.message).slice(0, 200)}`); }
     },
   };
+}
+
+// the reason this run's checker is broken, for the --health step (the first reason wins; the file is never committed)
+function noteBroken(why) {
+  try { if (!existsSync('.checker-broken')) writeFileSync('.checker-broken', String(why).slice(0, 300) + '\n'); } catch { /* the health step says "failed" without a reason */ }
+}
+
+// The checker's own health from the workflow's step outcomes (GitHub's steps.<id>.outcome: the result BEFORE
+// continue-on-error). -> {ok, kind, why} | null when the run was cancelled (a cancelled run says nothing either way).
+export function healthOf({ selftest, check, chain, note = '', loop = true }) {
+  const o = [selftest, check, chain];
+  if (o.includes('cancelled')) return null;
+  if (selftest !== 'success') return { ok: false, kind: 'selftest', why: "the checker's own self-test is red, so the site was not checked" };
+  if (check !== 'success') return { ok: false, kind: 'check', why: note ? `the check step failed: ${note}` : 'the check step failed (no reason recorded)' };
+  if (chain === 'failure') return { ok: false, kind: 'chain', why: 'the run could not start the next one, so the chain has stopped' };
+  if (loop && chain === 'skipped') return { ok: false, kind: 'chain', why: 'the run did not finish its loop, so no next run was started' };
+  return { ok: true, kind: 'ok', why: '' };
+}
+
+// Write state/health.json only when ok/kind changes; -> 'changed' | 'same' | 'cancelled'
+export function recordHealth(h, io, meta = {}) {
+  if (!h) return 'cancelled';
+  const prev = io.readState('state/health.json');
+  if (prev && prev.ok === h.ok && prev.kind === h.kind) return 'same';
+  io.writeState('state/health.json', { ...h, status: h.ok ? 'CHECKER OK' : 'CHECKER BROKEN', changed_utc: new Date(io.now()).toISOString(), ...meta });
+  return 'changed';
 }
 
 export function monitorsFromEnv(env = process.env) {
@@ -310,13 +349,57 @@ async function selfTest() {
     (await (async () => { const lines = []; const io2 = fakeIo({ E: [BAD] }); io2.log = (s) => lines.push(s);
       await runAll(mon(), io2, cfg); return lines.length > 0 && lines.every((l) => !/https?:\/\//.test(l)); })()));
 
-  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 16/16');
+  // H: the checker's own health (vercel-builds-uptime-1) -- a broken checker is recorded once per change, never red
+  const S = 'success', F = 'failure', K = 'skipped';
+  arm('H1 every step succeeded -> OK', healthOf({ selftest: S, check: S, chain: S })?.ok === true);
+  arm('H2 the 27 Sep 04:11Z failure (check step failed, "no targets") -> BROKEN naming the reason',
+    (() => { const h = healthOf({ selftest: S, check: F, chain: K, note: 'no targets configured (TARGETS_JSON / TEST_TARGETS are empty)' });
+      return h.ok === false && h.kind === 'check' && /no targets configured/.test(h.why); })());
+  arm('H3 self-test red (check skipped) -> BROKEN selftest', healthOf({ selftest: F, check: K, chain: K })?.kind === 'selftest');
+  arm('H4 could not start the next run -> BROKEN chain', healthOf({ selftest: S, check: S, chain: F })?.kind === 'chain');
+  arm('H5 a manual once=yes run skips the chain on purpose -> OK', healthOf({ selftest: S, check: S, chain: K, loop: false })?.ok === true);
+  arm('H6 a cancelled run records nothing', healthOf({ selftest: S, check: 'cancelled', chain: K }) === null);
+  const hio = fakeIo({});
+  const hs = [healthOf({ selftest: S, check: F, chain: K, note: 'x' }), healthOf({ selftest: S, check: F, chain: K, note: 'y' }),
+    healthOf({ selftest: S, check: S, chain: S }), healthOf({ selftest: S, check: S, chain: S })].map((h) => recordHealth(h, hio));
+  arm('H7 health is written only on a change: broken, still broken (new wording), fixed, still fixed -> changed, same, changed, same',
+    hs.join() === 'changed,same,changed,same' && hio.store['file:state/health.json']?.ok === true);
+  const nio = fakeIo({ E: [BAD] }, { sendOk: false }); const notes = []; nio.broken = (w) => notes.push(w);
+  await runAll(mon(), nio, cfg);
+  arm('H8 a message that fails to send records WHY the checker is broken', notes.length === 1 && /did not send \(fake failure\)/.test(notes[0]));
+  const { mkdtempSync } = await import('node:fs');
+  const hdir = mkdtempSync(`${(await import('node:os')).tmpdir()}/uptime-health-`);
+  const empty = spawnSync(process.execPath, [process.argv[1]], { encoding: 'utf8', cwd: hdir, env: { PATH: process.env.PATH } });
+  const hstep = spawnSync(process.execPath, [process.argv[1], '--health'], { encoding: 'utf8', cwd: hdir,
+    env: { PATH: process.env.PATH, SELFTEST_OUTCOME: S, CHECK_OUTCOME: empty.status === 0 ? S : F, CHAIN_OUTCOME: K, LOOP_MINUTES: '55' } });
+  let written = null; try { written = JSON.parse(readFileSync(`${hdir}/state/health.json`, 'utf8')); } catch { /* none */ }
+  arm('H9 ENTRY POINT, end to end: no targets -> the check exits 1 and records why; --health exits 0 and writes BROKEN with that reason',
+    empty.status === 1 && hstep.status === 0 && written?.ok === false && /no targets configured/.test(written?.why || ''));
+
+  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 25/25');
   return red ? 1 : 0;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   if (process.argv.includes('--self-test')) process.exit(await selfTest());
+  if (process.argv.includes('--health')) {
+    // never exits non-zero: this step exists so that a broken checker is recorded, not emailed
+    try {
+      const e = process.env;
+      let note = '';
+      try { note = readFileSync('.checker-broken', 'utf8').trim(); } catch { /* no reason recorded */ }
+      const h = healthOf({ selftest: e.SELFTEST_OUTCOME, check: e.CHECK_OUTCOME, chain: e.CHAIN_OUTCOME, note, loop: e.LOOP_MINUTES !== '0' });
+      const said = recordHealth(h, realIo(), { run_url: e.RUN_URL || null });
+      console.log(`checker health: ${h ? (h.ok ? 'OK' : `BROKEN (${h.kind}) ${h.why}`) : 'run cancelled, nothing recorded'} -- state/health.json ${said}`);
+    } catch (err) { console.log(`checker health could not be recorded: ${String(err?.message || err).slice(0, 200)}`); }
+    process.exit(0);
+  }
   const monitors = monitorsFromEnv();
-  if (!monitors().length) { console.log('no targets configured (TARGETS_JSON / TEST_TARGETS): nothing checked -- this run proves nothing'); process.exit(1); }
-  process.exit(await runAll(monitors, realIo()));
+  if (!monitors().length) {
+    noteBroken('no targets configured (TARGETS_JSON / TEST_TARGETS are empty)');
+    console.log('no targets configured (TARGETS_JSON / TEST_TARGETS): nothing checked -- this run proves nothing'); process.exit(1);
+  }
+  let rc;
+  try { rc = await runAll(monitors, realIo()); } catch (err) { noteBroken(`the checker crashed: ${String(err?.message || err).slice(0, 200)}`); throw err; }
+  process.exit(rc);
 }
