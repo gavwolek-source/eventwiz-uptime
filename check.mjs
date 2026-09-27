@@ -87,7 +87,7 @@ export async function round(targets, io, cfg) {
     await Promise.all(still.map(async (i) => { (again[i] ||= []).push(await io.probe(targets[i], cfg.timeout)); }));
     still = still.filter((i) => !again[i].at(-1).ok);
   }
-  const failing = still.map((i) => ({ name: targets[i].name, why: again[i].at(-1).why }));
+  const failing = still.map((i) => ({ name: targets[i].name, why: (again[i]?.at(-1) ?? first[i]).why }));
   const lines = targets.map((t, i) => `${t.name}: ${first[i].why} ${(first[i].ms / 1000).toFixed(1)}s`
     + (again[i] || []).map((x) => ` -> recheck ${x.why} ${(x.ms / 1000).toFixed(1)}s`).join(''));
   lines.push(`control: ${control.ok ? 'reachable' : control.why}`);
@@ -179,7 +179,7 @@ function realIo() {
   };
 }
 
-function monitorsFromEnv(env = process.env) {
+export function monitorsFromEnv(env = process.env) {
   const parse = (name, v) => { const t = JSON.parse(v); if (!Array.isArray(t) || !t.length) throw new Error(`${name} is not a non-empty list`); return t; };
   const live = env.TARGETS_JSON ? { label: '', targets: parse('TARGETS_JSON', env.TARGETS_JSON), stateFile: 'state/live.json' } : null;
   return () => {
@@ -297,17 +297,26 @@ async function selfTest() {
   arm('S14 test targets pushed while a run is going are picked up at the next round, and page once',
     io.sent.length === 1 && /^TEST/.test(io.sent[0]));
 
+  // S15 drives the ENTRY POINT's own wiring: MEASURED 2026-09-27, a refactor made the monitor list a function and
+  // the entry point read `.length` of the function (always 0) and refused to run -- every arm above still passed.
+  const { spawnSync } = await import('node:child_process');
+  const entry = spawnSync(process.execPath, [process.argv[1]], { encoding: 'utf8', cwd: (await import('node:os')).tmpdir(),
+    env: { PATH: process.env.PATH, TARGETS_JSON: JSON.stringify([{ name: 'unroutable', url: 'http://127.0.0.1:9/', status: 200 }]),
+      ROUNDS: '1', RETRIES: '0', TIMEOUT: '2', CONTROL_URL: 'http://127.0.0.1:9/' } });
+  arm('S15 the entry point runs the configured targets (one round, no network: UNKNOWN, nothing sent)',
+    /round 1 UNKNOWN \| unroutable: could not connect/.test(entry.stdout) && !/no targets configured/.test(entry.stdout));
+
   arm('S11 no URL is ever printed: log lines carry target names only',
     (await (async () => { const lines = []; const io2 = fakeIo({ E: [BAD] }); io2.log = (s) => lines.push(s);
       await runAll(mon(), io2, cfg); return lines.length > 0 && lines.every((l) => !/https?:\/\//.test(l)); })()));
 
-  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 15/15');
+  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 16/16');
   return red ? 1 : 0;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   if (process.argv.includes('--self-test')) process.exit(await selfTest());
   const monitors = monitorsFromEnv();
-  if (!monitors.length) { console.log('no targets configured (TARGETS_JSON / TEST_TARGETS): nothing checked -- this run proves nothing'); process.exit(1); }
+  if (!monitors().length) { console.log('no targets configured (TARGETS_JSON / TEST_TARGETS): nothing checked -- this run proves nothing'); process.exit(1); }
   process.exit(await runAll(monitors, realIo()));
 }
