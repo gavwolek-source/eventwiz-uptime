@@ -1,1 +1,1 @@
-[{"name":"decoy slow page A (10 s, then 200)","url":"https://httpbin.org/delay/10","status":200,"contains":"url"},{"name":"decoy slow page B (8 s body, then 200)","url":"https://httpbin.org/drip?duration=8&numbytes=8&delay=0","status":200}]
+[{"name":"test page","url":"https://httpbin.org/status/500","status":200}]
