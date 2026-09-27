@@ -2,29 +2,37 @@
 # github.com/gavwolek-source/eventwiz-uptime (public, so GitHub's runner minutes cost nothing).
 # Source of truth: eventwiz scripts/uptime-monitor/ (launch-restore-alert-1, 2026-09-27); publish.sh copies it here.
 #
-# Every 5 minutes (GitHub may start a scheduled run late under load; the report measures how late), one run checks
-# the site twice, 150 s apart, and Telegrams Gavin ONCE when it goes down and ONCE when it comes back.
-# The live targets are the secret TARGETS_JSON; the repo variable TEST_TARGETS, when set, adds a labelled TEST monitor
-# that is how the alarm is proved (point it at an address that answers 500, and the TEST message arrives).
+# HOW IT KEEPS RUNNING: a CHAIN. Each run checks the site every 2 minutes for 55 minutes, then starts the next run itself
+# (GitHub's docs: workflow_dispatch events made with the job's own GITHUB_TOKEN "always create workflow runs").
+# It does not rely on GitHub's schedule, which MEASURED 2026-09-27 started no scheduled run at all in this new repo's
+# first 80+ minutes. The schedule below is only a RESTARTER: if the chain ever breaks, the next scheduled run that GitHub
+# does start picks it up again (the concurrency group keeps it to one run at a time).
+# Telegrams Gavin ONCE when the site goes down and ONCE when it comes back. Live targets: the secret TARGETS_JSON.
+# The alarm is proved with test-targets.json (re-read every round) or the TEST_TARGETS variable: labelled TEST messages.
 name: uptime
 on:
   schedule:
-    - cron: '2-59/5 * * * *'   # :02, :07, … — off the round minutes GitHub's docs name as its busiest (the start of every hour)
+    - cron: '17,47 * * * *'   # restarter only -- off the round minutes GitHub's docs name as its busiest
   workflow_dispatch:
     inputs:
+      once:
+        description: 'yes = two rounds and stop, no chain (a manual test)'
+        required: false
+        default: ''
       test_targets:
         description: 'JSON list of targets for a labelled TEST monitor (overrides the TEST_TARGETS variable)'
         required: false
         default: ''
 permissions:
   contents: write   # to commit state/*.json when the site's state changes (and only then)
+  actions: write    # to start the next run of the chain
 concurrency:
   group: uptime
   cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: self-test (the rules, against a fake network -- a red here means the checker itself is broken)
@@ -36,4 +44,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           COMMIT_STATE: '1'
+          LOOP_MINUTES: ${{ github.event.inputs.once == 'yes' && '0' || '55' }}
+          ROUND_GAP: '120'
         run: node check.mjs
+      - name: start the next run (only after a full 55-minute loop, so a broken run can never start a rapid chain)
+        if: ${{ !cancelled() && hashFiles('.chain-ok') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run uptime.yml --repo "$GITHUB_REPOSITORY" --ref main

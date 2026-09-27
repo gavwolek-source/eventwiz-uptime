@@ -5,8 +5,12 @@
 // Live copy: github.com/gavwolek-source/eventwiz-uptime (a public repo, so its Actions minutes are free).
 // Source of truth: eventwiz scripts/uptime-monitor/ -- publish.sh copies it across; UPTIME#1 checks they match.
 //
-// What it does, each run (the workflow starts one every 5 minutes):
-//   ROUNDS rounds, ROUND_GAP seconds apart. In each round every target is fetched at once. A target that fails is
+// What it does, each run:
+//   With LOOP_MINUTES > 0 (the chain, how it runs live): rounds ROUND_GAP seconds apart for LOOP_MINUTES, then it
+//   leaves a `.chain-ok` file and the workflow starts the next run. A chain does not wait on GitHub's schedule, which
+//   MEASURED 2026-09-27 started NO scheduled run in the first 80+ minutes of a new repo (users report hours to days).
+//   The schedule remains only as a restarter if the chain breaks. With LOOP_MINUTES 0: ROUNDS rounds, then stop.
+//   Each round: ROUND_GAP seconds apart. In each round every target is fetched at once. A target that fails is
 //   fetched again RETRIES times, RETRY_GAP seconds apart, and only a failure that repeats EVERY time counts.
 //   (MEASURED 2026-09-27 on GitHub's runners: single connection resets in 0.1 s happen -- one on the live event data,
 //   two in a row from a third-party test host -- so one recheck was not enough; two blips never page.)
@@ -23,7 +27,9 @@
 //   TARGETS_JSON  the live targets (a secret: it names the event page)    -> state/live.json, no label
 //   TEST_TARGETS  labelled test targets (a repo variable, normally unset)  -> state/test.json, every message "TEST"
 //   Target: {"name": "rsvp api", "url": "...", "status": 404, "contains": "Invalid RSVP link", "headers": {...}}
-// Other env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ROUNDS (2), ROUND_GAP (150), RETRIES (2), RETRY_GAP (15), TIMEOUT (30),
+//   Test targets can also come from `test-targets.json` in the repo, re-read (after a git pull) EVERY round, so a
+//   pushed change reaches a run that is already going -- that is how the alarm is proved end to end.
+// Other env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, LOOP_MINUTES (0), ROUNDS (2), ROUND_GAP (150), RETRIES (2), RETRY_GAP (15), TIMEOUT (30),
 //   CONTROL_URL (https://api.github.com/zen), COMMIT_STATE=1 to commit+push a changed state file at once.
 // URLs are never printed: logs name targets only (the live list is a secret; GitHub also masks secrets).
 //
@@ -35,6 +41,7 @@ import { dirname } from 'node:path';
 
 const num = (v, d) => (v === undefined || v === '' ? d : Number(v));
 const CFG = {
+  loopMinutes: num(process.env.LOOP_MINUTES, 0),
   rounds: num(process.env.ROUNDS, 2),
   roundGap: num(process.env.ROUND_GAP, 150),
   retryGap: num(process.env.RETRY_GAP, 15),
@@ -114,12 +121,18 @@ export async function sendTelegram(text, env = process.env) {
   } catch (e) { return { ok: false, why: `Telegram unreachable (${e?.name})` }; }
 }
 
-// the whole run; io = {probe, sleep, send, now, readState, writeState, log}. Returns an exit code.
+// the whole run; io = {probe, sleep, send, now, readState, writeState, log, chainOk}. `monitors` is a list, or a
+// function returning the list, called afresh every round. Returns an exit code.
 export async function runAll(monitors, io, cfg = CFG) {
   let rc = 0;
-  for (let r = 1; r <= cfg.rounds; r++) {
+  const list = typeof monitors === 'function' ? monitors : () => monitors;
+  const t0 = io.now();
+  const another = (r) => (cfg.loopMinutes > 0
+    ? io.now() - t0 + cfg.roundGap * 1000 < cfg.loopMinutes * 60000
+    : r < cfg.rounds);
+  for (let r = 1; ; r++) {
     if (r > 1) await io.sleep(cfg.roundGap);
-    for (const m of monitors) {
+    for (const m of list()) {
       const res = await round(m.targets, io, cfg);
       const tag = m.label ? `[${m.label}] ` : '';
       io.log(`round ${r} ${tag}${res.state} | ${res.lines.join(' | ')}`);
@@ -137,7 +150,10 @@ export async function runAll(monitors, io, cfg = CFG) {
       io.log(`${tag}SENT ${prev.status} -> ${res.state} (telegram message ${sent.id ?? '?'})`);
       io.writeState(m.stateFile, { status: res.state, since: now, failing: res.failing, changed_utc: new Date(now).toISOString(), telegram_message_id: sent.id ?? null });
     }
+    if (!another(r)) break;
   }
+  // only a run that did its whole loop hands on to a next one: a run that dies early never starts a rapid-fire chain
+  if (cfg.loopMinutes > 0) io.chainOk();
   return rc;
 }
 
@@ -146,6 +162,7 @@ function realIo() {
     probe, now: () => Date.now(), log: (s) => console.log(`${new Date().toISOString().slice(11, 19)} ${s}`),
     sleep: (s) => new Promise((res) => setTimeout(res, s * 1000)),
     send: (text) => sendTelegram(text),
+    chainOk: () => writeFileSync('.chain-ok', new Date().toISOString() + '\n'),
     readState: (f) => { try { return JSON.parse(readFileSync(f, 'utf8')); } catch { return null; } },
     writeState: (f, v) => {
       mkdirSync(dirname(f), { recursive: true });
@@ -163,11 +180,21 @@ function realIo() {
 }
 
 function monitorsFromEnv(env = process.env) {
-  const ms = [];
   const parse = (name, v) => { const t = JSON.parse(v); if (!Array.isArray(t) || !t.length) throw new Error(`${name} is not a non-empty list`); return t; };
-  if (env.TARGETS_JSON) ms.push({ label: '', targets: parse('TARGETS_JSON', env.TARGETS_JSON), stateFile: 'state/live.json' });
-  if (env.TEST_TARGETS && env.TEST_TARGETS.trim()) ms.push({ label: 'TEST', targets: parse('TEST_TARGETS', env.TEST_TARGETS), stateFile: 'state/test.json' });
-  return ms;
+  const live = env.TARGETS_JSON ? { label: '', targets: parse('TARGETS_JSON', env.TARGETS_JSON), stateFile: 'state/live.json' } : null;
+  return () => {
+    const ms = live ? [live] : [];
+    let test = env.TEST_TARGETS && env.TEST_TARGETS.trim() ? env.TEST_TARGETS : null;
+    if (!test) {
+      if (env.COMMIT_STATE === '1') { try { execFileSync('git', ['pull', '-q', '--rebase'], { stdio: 'pipe' }); } catch { /* next round tries again */ } }
+      try { const f = readFileSync('test-targets.json', 'utf8').trim(); if (f && f !== '[]') test = f; } catch { /* no file: no test monitor */ }
+    }
+    if (test) {
+      try { ms.push({ label: 'TEST', targets: parse('TEST targets', test), stateFile: 'state/test.json' }); }
+      catch (e) { console.log(`TEST targets unreadable, skipped: ${e.message}`); }
+    }
+    return ms;
+  };
 }
 
 // ── self-test: every rule in the header, against a fake network, clock and Telegram ─────────────────────────
@@ -177,13 +204,16 @@ async function selfTest() {
   const arm = (name, ok) => { console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}`); if (!ok) red++; };
   // scripted network: answers[url] is a list consumed per call (last one repeats)
   const fakeIo = (answers, { sendOk = true, state = null } = {}) => {
-    const calls = {}, sent = [], store = { f: state };
+    const calls = {}, sent = [], store = { f: state, chained: 0 };
+    let t = Date.parse('2026-09-27T03:00:00Z');
     return {
-      sent, store,
+      sent, store, calls, chainOk: () => { store.chained++; },
       probe: async (t) => { const a = answers[t.url] || [{ ok: true, why: 'HTTP 200', ms: 100 }]; const i = calls[t.url] = (calls[t.url] ?? -1) + 1; return a[Math.min(i, a.length - 1)]; },
-      sleep: async () => {}, now: () => Date.parse('2026-09-27T03:00:00Z'), log: () => {},
+      sleep: async (sec) => { t += sec * 1000; }, now: () => t, log: () => {},
       send: async (text) => { sent.push(text); return sendOk ? { ok: true, id: 1 } : { ok: false, why: 'fake failure' }; },
-      readState: () => store.f, writeState: (_f, v) => { store.f = v; },
+      // one slot per state file; 'f' is the one the arms read back as store.f
+      readState: (file) => (file === 'f' ? store.f : store[`file:${file}`] ?? null),
+      writeState: (file, v) => { if (file === 'f') store.f = v; else store[`file:${file}`] = v; },
     };
   };
   const T = [{ name: 'home', url: 'H' }, { name: 'event page', url: 'E' }, { name: 'rsvp api', url: 'R' }];
@@ -251,11 +281,27 @@ async function selfTest() {
     good.ok && !wrong.ok && /not the right one/.test(wrong.why) && !s500.ok && s500.why === 'HTTP 500'
     && !hang.ok && /no answer in 1 s/.test(hang.why) && slow.ok);
 
+  io = fakeIo({});
+  await runAll(mon(), io, { ...cfg, loopMinutes: 10, roundGap: 120 });
+  arm('S12 the chain: rounds 120 s apart for 10 minutes (5 rounds), then it hands on to the next run',
+    io.calls.CONTROL + 1 === 5 && io.store.chained === 1); // calls[] holds the index of the last call
+
+  io = fakeIo({});
+  await runAll(mon(), io, cfg);
+  arm('S13 a plain run (no loop) never starts a next run -- a run that dies early cannot start a rapid-fire chain', io.store.chained === 0);
+
+  io = fakeIo({ X: [BAD] });
+  let n = 0;
+  await runAll(() => (n++ === 0 ? mon() : [...mon(), { label: 'TEST', targets: [{ name: 'test', url: 'X' }], stateFile: 't' }]), io,
+    { ...cfg, loopMinutes: 5, roundGap: 120 });
+  arm('S14 test targets pushed while a run is going are picked up at the next round, and page once',
+    io.sent.length === 1 && /^TEST/.test(io.sent[0]));
+
   arm('S11 no URL is ever printed: log lines carry target names only',
     (await (async () => { const lines = []; const io2 = fakeIo({ E: [BAD] }); io2.log = (s) => lines.push(s);
       await runAll(mon(), io2, cfg); return lines.length > 0 && lines.every((l) => !/https?:\/\//.test(l)); })()));
 
-  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 12/12');
+  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 15/15');
   return red ? 1 : 0;
 }
 
