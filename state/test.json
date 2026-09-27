@@ -1,12 +1,7 @@
 {
- "status": "DOWN",
- "since": 1790478981380,
- "failing": [
-  {
-   "name": "decoy slow page A (10 s, then 200)",
-   "why": "could not connect (ECONNRESET)"
-  }
- ],
- "changed_utc": "2026-09-27T03:16:21.380Z",
- "telegram_message_id": 2224
+ "status": "UP",
+ "since": 1790479175597,
+ "failing": [],
+ "changed_utc": "2026-09-27T03:19:35.597Z",
+ "telegram_message_id": 2225
 }
