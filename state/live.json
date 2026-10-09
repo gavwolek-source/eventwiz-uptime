@@ -1,20 +1,7 @@
 {
- "status": "DOWN",
- "since": 1791517446807,
- "failing": [
-  {
-   "name": "home",
-   "why": "HTTP 403"
-  },
-  {
-   "name": "event page",
-   "why": "HTTP 403"
-  },
-  {
-   "name": "rsvp api",
-   "why": "HTTP 403"
-  }
- ],
- "changed_utc": "2026-10-09T03:44:06.807Z",
- "telegram_message_id": 2591
+ "status": "UP",
+ "since": 1791518328211,
+ "failing": [],
+ "changed_utc": "2026-10-09T03:58:48.211Z",
+ "telegram_message_id": 2593
 }
