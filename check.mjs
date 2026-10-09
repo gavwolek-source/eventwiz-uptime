@@ -14,7 +14,8 @@
 //   fetched again RETRIES times, RETRY_GAP seconds apart, and only a failure that repeats EVERY time counts.
 //   (MEASURED 2026-09-27 on GitHub's runners: single connection resets in 0.1 s happen -- one on the live event data,
 //   two in a row from a third-party test host -- so one recheck was not enough; two blips never page.)
-//   Site state: DOWN if any target's failure repeated, UP if every target passed, and UNKNOWN when this machine
+//   Site state: DOWN if any target's failure repeated, UP if every target passed, REFUSED when the only failures are
+//   Vercel turning THIS checker away (refusedOnly(): never pages; the PC's second check decides), and UNKNOWN when this machine
 //   could not reach the control address either -- a runner with no network is not an outage, and UNKNOWN never
 //   changes the state or sends a message.
 //   Telegram: ONE message when the state goes UP -> DOWN, ONE when it goes DOWN -> UP. Nothing on a good run.
@@ -76,7 +77,11 @@ export async function probe(t, timeoutS) {
       redirect: 'follow', signal: AbortSignal.timeout(timeoutS * 1000), cache: 'no-store' });
     const body = await r.text();
     const ms = Date.now() - t0;
-    if (r.status !== (t.status ?? 200)) return { ok: false, why: `HTTP ${r.status}`, ms };
+    // Vercel's own edge marks a request it refused (MEASURED 2026-10-09: `x-vercel-mitigated: challenge` with HTTP 403 on
+    // every www target, from sys_dos_mitigation). Undocumented by Vercel, so it is evidence the CHECKER was refused,
+    // never proof the site is up: refusedOnly() only stops the page; the PC's second check decides.
+    const mitigated = r.headers.get('x-vercel-mitigated') || (/Vercel Security Checkpoint/.test(body) ? 'checkpoint' : null);
+    if (r.status !== (t.status ?? 200)) return { ok: false, why: `HTTP ${r.status}`, ms, status: r.status, mitigated };
     if (t.contains && !body.includes(t.contains)) return { ok: false, why: `HTTP ${r.status} but the page was not the right one`, ms };
     return { ok: true, why: `HTTP ${r.status}`, ms };
   } catch (e) {
@@ -98,14 +103,31 @@ export async function round(targets, io, cfg) {
     await Promise.all(still.map(async (i) => { (again[i] ||= []).push(await io.probe(targets[i], cfg.timeout)); }));
     still = still.filter((i) => !again[i].at(-1).ok);
   }
-  const failing = still.map((i) => ({ name: targets[i].name, why: (again[i]?.at(-1) ?? first[i]).why }));
+  const failing = still.map((i) => { const last = again[i]?.at(-1) ?? first[i];
+    return { name: targets[i].name, why: last.why, ...(last.status ? { status: last.status } : {}), ...(last.mitigated ? { mitigated: last.mitigated } : {}) }; });
   const lines = targets.map((t, i) => `${t.name}: ${first[i].why} ${(first[i].ms / 1000).toFixed(1)}s`
     + (again[i] || []).map((x) => ` -> recheck ${x.why} ${(x.ms / 1000).toFixed(1)}s`).join(''));
   lines.push(`control: ${control.ok ? 'reachable' : control.why}`);
   if (!failing.length) return { state: 'UP', failing, lines };
   // this machine cannot reach the outside world either: we cannot see the site, which is not the same as it being down
   if (!control.ok) return { state: 'UNKNOWN', failing, lines };
+  if (refusedOnly(targets, failing)) return { state: 'REFUSED', failing, lines };
   return { state: 'DOWN', failing, lines };
+}
+
+// REFUSED (site-check-and-repeats-1, 2026-10-09): THIS checker was turned away, which is not the site being down.
+// MEASURED 14:44 Sydney 9 Oct: Vercel's platform DoS mitigation challenged the GitHub runner's address (45 challenges, all
+// `eventwiz-uptime/1`, one address; 0 real visitors challenged) and the checker paged "site DOWN" on HTTP 403 x3.
+// A round is REFUSED when every failure is an HTTP 403 AND either one of them carries Vercel's refusal marker, or the
+// 403s cover EVERY target on each refusing host (a 403 on every page). A 403 on one route alone is still DOWN: that is a
+// route broken, not a checker refused. Anything else failing (a 500, a timeout, a wrong page) makes it DOWN as before.
+export function refusedOnly(targets, failing) {
+  if (!failing.length || !failing.every((f) => f.status === 403)) return false;
+  if (failing.some((f) => f.mitigated)) return true;
+  const host = (t) => { try { return new URL(t.url).host; } catch { return t.url; } };
+  const failed = new Set(failing.map((f) => f.name));
+  const hosts = new Set(targets.filter((t) => failed.has(t.name)).map(host));
+  return [...hosts].every((h) => targets.filter((t) => host(t) === h).every((t) => failed.has(t.name)));
 }
 
 export function message(label, prev, next, failing, nowMs, nTargets) {
@@ -151,6 +173,18 @@ export async function runAll(monitors, io, cfg = CFG) {
       const prev = io.readState(m.stateFile) || { status: 'UP' };
       if (prev.status === res.state) continue;
       const now = io.now();
+      // REFUSED never pages from here. It is recorded (state file, committed on a change) so the PC's second,
+      // independent check (scripts/reality-check-uptime.mjs --second-check) probes the site itself and pages only if it
+      // fails too. An outage already told (DOWN) stays told until a real answer says otherwise. Leaving REFUSED for UP
+      // is silent too: no "site down" was ever sent, so no "back up" is owed.
+      const silent = (why) => { io.log(`${tag}${prev.status} -> ${res.state}: ${why} (no message)`);
+        io.writeState(m.stateFile, { status: res.state, since: now, failing: res.failing, changed_utc: new Date(now).toISOString(), telegram_message_id: null }); };
+      if (res.state === 'REFUSED') {
+        if (prev.status === 'DOWN') { io.log(`${tag}still DOWN as last told; this round the checker was refused, which says nothing either way`); continue; }
+        silent('the outside checker was refused (HTTP 403 from Vercel), not the site down; the PC\'s second check decides');
+        continue;
+      }
+      if (prev.status === 'REFUSED' && res.state === 'UP') { silent('the checker is let through again'); continue; }
       const text = message(m.label, prev, res.state, res.failing, now, m.targets.length);
       const sent = await io.send(text);
       if (!sent.ok) {
@@ -240,7 +274,8 @@ export function monitorsFromEnv(env = process.env) {
 async function selfTest() {
   const cfg = { rounds: 1, roundGap: 0, retryGap: 0, retries: 2, timeout: 45, control: 'CONTROL' };
   let red = 0;
-  const arm = (name, ok) => { console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}`); if (!ok) red++; };
+  let total = 0;
+  const arm = (name, ok) => { total++; console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}`); if (!ok) red++; };
   // scripted network: answers[url] is a list consumed per call (last one repeats)
   const fakeIo = (answers, { sendOk = true, state = null } = {}) => {
     const calls = {}, sent = [], store = { f: state, chained: 0 };
@@ -349,6 +384,49 @@ async function selfTest() {
     (await (async () => { const lines = []; const io2 = fakeIo({ E: [BAD] }); io2.log = (s) => lines.push(s);
       await runAll(mon(), io2, cfg); return lines.length > 0 && lines.every((l) => !/https?:\/\//.test(l)); })()));
 
+  // R: a refused checker is not a site down (site-check-and-repeats-1, 2026-10-09). URL-shaped targets so hosts are real.
+  const W = [{ name: 'home', url: 'https://www.site.test/' }, { name: 'event page', url: 'https://www.site.test/en/w/x' },
+    { name: 'event data', url: 'https://db.site.test/rest/v1/x' }, { name: 'rsvp api', url: 'https://www.site.test/api/rsvp/0' }];
+  const wmon = () => [{ label: '', targets: W, stateFile: 'f' }];
+  const F403 = { ok: false, why: 'HTTP 403', ms: 90, status: 403 }, CH403 = { ...F403, mitigated: 'challenge' };
+  const F500 = { ok: false, why: 'HTTP 500', ms: 90, status: 500 };
+  const www = (a) => ({ 'https://www.site.test/': a, 'https://www.site.test/en/w/x': a, 'https://www.site.test/api/rsvp/0': a });
+  io = fakeIo(www([F403]));
+  await runAll(wmon(), io, cfg);
+  arm('R1 the 14:44 replay: HTTP 403 on every www page, the database read passing -> REFUSED, NO "site DOWN", state REFUSED',
+    io.sent.length === 0 && io.store.f?.status === 'REFUSED' && io.store.f.failing.length === 3);
+  io = fakeIo({ 'https://www.site.test/api/rsvp/0': [F403] });
+  await runAll(wmon(), io, cfg);
+  arm('R2 a 403 on ONE route only, no refusal marker -> DOWN pages (a broken route, not a refused checker)',
+    io.sent.length === 1 && /DOWN/.test(io.sent[0]) && /rsvp api: HTTP 403/.test(io.sent[0]) && io.store.f?.status === 'DOWN');
+  io = fakeIo({ 'https://www.site.test/': [CH403] });
+  await runAll(wmon(), io, cfg);
+  arm('R3 a 403 carrying Vercel\'s refusal marker (x-vercel-mitigated) -> REFUSED, no message', io.sent.length === 0 && io.store.f?.status === 'REFUSED');
+  io = fakeIo({ ...www([F403]), 'https://www.site.test/en/w/x': [F500] });
+  await runAll(wmon(), io, cfg);
+  arm('R4 a real outage mixed with 403s (a 500 on the event page) -> DOWN pages', io.sent.length === 1 && /event page: HTTP 500/.test(io.sent[0]));
+  io = fakeIo({ 'https://db.site.test/rest/v1/x': [F500] });
+  await runAll(wmon(), io, cfg);
+  arm('R5 a real outage, no 403 anywhere -> DOWN pages, as before', io.sent.length === 1 && /DOWN/.test(io.sent[0]));
+  io = fakeIo({}, { state: { status: 'REFUSED', since: Date.parse('2026-09-27T02:40:00Z') } });
+  await runAll(wmon(), io, cfg);
+  arm('R6 refused, then let through: silent (no "back UP" is owed), state UP', io.sent.length === 0 && io.store.f?.status === 'UP');
+  io = fakeIo({ 'https://www.site.test/': [F500] }, { state: { status: 'REFUSED', since: Date.parse('2026-09-27T02:40:00Z') } });
+  await runAll(wmon(), io, cfg);
+  arm('R7 refused, then a real failure: DOWN pages', io.sent.length === 1 && /DOWN/.test(io.sent[0]) && io.store.f?.status === 'DOWN');
+  io = fakeIo(www([CH403]), { state: { status: 'DOWN', since: Date.parse('2026-09-27T02:40:00Z') } });
+  await runAll(wmon(), io, cfg);
+  arm('R8 already told DOWN, then refused: no message, still DOWN', io.sent.length === 0 && io.store.f?.status === 'DOWN');
+  arm('R9 refusedOnly is false with nothing failing and with a timeout among the 403s',
+    !refusedOnly(W, []) && !refusedOnly(W, [{ name: 'home', status: 403 }, { name: 'event page', why: 'no answer in 30 s' }, { name: 'rsvp api', status: 403 }]));
+  {
+    const rs = createServer((req, res) => { res.writeHead(403, { 'x-vercel-mitigated': 'challenge' }); res.end('<title>Vercel Security Checkpoint</title>'); });
+    await new Promise((r) => rs.listen(0, '127.0.0.1', r));
+    const got = await probe({ url: `http://127.0.0.1:${rs.address().port}/`, status: 200, contains: 'EventWiz' }, 2);
+    rs.closeAllConnections?.(); rs.close();
+    arm('R10 real probe: a 403 with x-vercel-mitigated is read as HTTP 403, mitigated=challenge', !got.ok && got.status === 403 && got.mitigated === 'challenge');
+  }
+
   // H: the checker's own health (vercel-builds-uptime-1) -- a broken checker is recorded once per change, never red
   const S = 'success', F = 'failure', K = 'skipped';
   arm('H1 every step succeeded -> OK', healthOf({ selftest: S, check: S, chain: S })?.ok === true);
@@ -376,7 +454,7 @@ async function selfTest() {
   arm('H9 ENTRY POINT, end to end: no targets -> the check exits 1 and records why; --health exits 0 and writes BROKEN with that reason',
     empty.status === 1 && hstep.status === 0 && written?.ok === false && /no targets configured/.test(written?.why || ''));
 
-  console.log(red ? `SELF-TEST RED: ${red} arm(s)` : 'SELF-TEST GREEN: 25/25');
+  console.log(red ? `SELF-TEST RED: ${red} of ${total} arm(s)` : `SELF-TEST GREEN: ${total}/${total}`);
   return red ? 1 : 0;
 }
 
